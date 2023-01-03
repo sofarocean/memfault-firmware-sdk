@@ -4,30 +4,16 @@
 //! See License.txt for details
 //!
 //! Reference implementation of platform dependency functions to use a sectors of internal flash
-//! on the STM32L4 family for coredump capture.
+//! on the STM32U5 family for coredump capture.
 //!
 //! To use, update your linker script (.ld file) to expose information about the location to use.
 //!
-//! For example, using the last 64kB (32 sectors) of the STM32L475VGT (1MB dual banked flash) would
-//! look something like this:
-//!
-//! MEMORY
-//! {
-//!    /* ... other regions ... */
-//!    COREDUMP_STORAGE_FLASH (rx) : ORIGIN = 0x80f0000, LENGTH = 64K
-//! }
-//! __MemfaultCoreStorageStart = ORIGIN(COREDUMP_STORAGE_FLASH);
-//! __MemfaultCoreStorageEnd = ORIGIN(COREDUMP_STORAGE_FLASH) + LENGTH(COREDUMP_STORAGE_FLASH);
-//!
-//! Notes:
-//!  - STM32L4 internal flash is contiguous and every sector has the same sector size
-//!  - __MemfaultCoreStorageStart & __MemfaultCoreStorageEnd must be aligned on sector
-//!    boundaries
 
 #include "memfault/panics/coredump.h"
 #include "memfault/ports/buffered_coredump_storage.h"
 
 #include <string.h>
+#include <stdio.h>
 
 #include "memfault/config.h"
 #include "memfault/core/compiler.h"
@@ -35,7 +21,7 @@
 #include "memfault/core/math.h"
 #include "memfault/core/platform/core.h"
 #include "memfault/panics/platform/coredump.h"
-#include "memfault/ports/stm32cube/l4/flash.h"
+// #include "memfault/ports/stm32cube/u5/flash.h"
 
 #include "stm32u5xx_hal.h"
 
@@ -49,6 +35,7 @@ extern uint32_t __MemfaultCoreStorageEnd[];
 #define MEMFAULT_COREDUMP_STORAGE_END_ADDR ((uint32_t)__MemfaultCoreStorageEnd)
 #endif
 
+// TODO - figure out if this also works on the U5!
 bool memfault_stm32cubeu5_flash_clear_ecc_error(
     uint32_t start_addr, uint32_t end_addr, uint32_t *corrupted_address) {
   const bool eccd_error = __HAL_FLASH_GET_FLAG(FLASH_FLAG_ECCD);
@@ -63,7 +50,7 @@ bool memfault_stm32cubeu5_flash_clear_ecc_error(
   uint32_t corrupted_flash_address =
       FLASH_BASE + ((eccr & FLASH_ECCR_ADDR_ECC) >> FLASH_ECCR_ADDR_ECC_Pos);
 
-  // if the STM32L4 is dual-banked check to see what bank has a bit corrupted
+  // if the STM32U5 is dual-banked check to see what bank has a bit corrupted
 #if defined(FLASH_OPTR_BFB2)
   if ((eccr & FLASH_ECCR_BK_ECC) != 0) {
     corrupted_flash_address += FLASH_BANK_SIZE;
@@ -80,7 +67,7 @@ bool memfault_stm32cubeu5_flash_clear_ecc_error(
     return -1;
   }
 
-  // NB: The STM32L4 allows for a double word to reprogrammed to 0x0. If the word
+  // NB: The STM32U5 allows for a double word to reprogrammed to 0x0. If the word
   // had an ECC error for some reason, this will also clear the ECC bits and the error
   // on the word
 
@@ -98,7 +85,6 @@ bool memfault_stm32cubeu5_flash_clear_ecc_error(
 void memfault_platform_fault_handler(const sMfltRegState *regs, eMemfaultRebootReason reason) {
   memfault_stm32cubeu5_flash_clear_ecc_error(
       MEMFAULT_COREDUMP_STORAGE_START_ADDR, MEMFAULT_COREDUMP_STORAGE_END_ADDR, NULL);
-
 }
 
 // Error writing to flash - should never happen & likely detects a configuration error
@@ -121,17 +107,17 @@ void memfault_platform_coredump_storage_get_info(sMfltCoredumpStorageInfo *info)
 
   *info  = (sMfltCoredumpStorageInfo) {
     .size = size,
-    // The STM32L4 series has a fixed page size and a contiguous address layout
+    // The STM32U5 series has a fixed page size and a contiguous address layout
     .sector_size = FLASH_PAGE_SIZE,
   };
 }
 
-// NOTE: The internal STM32L4 flash uses 8 ECC bits over 8 byte "memory words". Since the ECC
-// bits are also in NOR flash, this means 8 byte hunks can only be written once since changing
+// NOTE: The internal STM32U5 flash uses 9 ECC bits over 16 byte "memory words". Since the ECC
+// bits are also in NOR flash, this means 16 byte hunks can only be written once since changing
 // a value in the double word after the fact would cause the ECC to fail.
 //
-// In practice this means, writes must be issued 8 bytes at a time. The code below accomplishes
-// this by buffering writes and then flushing in 8 byte hunks. The Memfault coredump writer is
+// In practice this means, writes must be issued 16 bytes at a time. The code below accomplishes
+// this by buffering writes and then flushing in 16 byte hunks. The Memfault coredump writer is
 // guaranteed to issue writes sequentially with the exception of the header which is at the
 // beginning of the coredump region and written last.
 
@@ -141,11 +127,12 @@ bool memfault_platform_coredump_storage_buffered_write(sCoredumpWorkingBuffer *b
 
   HAL_FLASH_Unlock();
   {
-    uint64_t data;
+    // 128-bit writes for STM32U5
+    uint32_t data[4] = {0};
     for (size_t i = 0; i < MEMFAULT_COREDUMP_STORAGE_WRITE_SIZE; i += sizeof(data)) {
       memcpy(&data, &blk->data[i], sizeof(data));
 
-      const uint32_t res = HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, addr + i, data);
+      const uint32_t res = HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, addr + i, (uint32_t)&data);
 
       if (res != HAL_OK) {
         prv_coredump_writer_assert_and_reboot(res);
@@ -161,9 +148,9 @@ bool memfault_platform_coredump_storage_buffered_write(sCoredumpWorkingBuffer *b
 void memfault_platform_coredump_storage_clear(void) {
   HAL_FLASH_Unlock();
   {
-    const uint64_t clear_val = 0x0;
+    const uint32_t clear_val[4] = {0};
     const uint32_t res = HAL_FLASH_Program(
-        FLASH_TYPEPROGRAM_QUADWORD, MEMFAULT_COREDUMP_STORAGE_START_ADDR, clear_val);
+        FLASH_TYPEPROGRAM_QUADWORD, MEMFAULT_COREDUMP_STORAGE_START_ADDR, (uint32_t)&clear_val);
 
     if (res != HAL_OK) {
       MEMFAULT_LOG_ERROR("Could not clear coredump storage, 0x%" PRIx32, res);
@@ -208,8 +195,8 @@ bool memfault_platform_coredump_storage_erase(uint32_t offset, size_t erase_size
     return false;
   }
 
-  const size_t stm32_u5_flash_end_addr = (FLASH_BASE + FLASH_SIZE + 1);
-  const size_t stm32_u5_flash_bank1_end_addr = (FLASH_BASE + FLASH_BANK_SIZE + 1);
+  const size_t stm32_u5_flash_end_addr = (FLASH_BASE + FLASH_SIZE);
+  const size_t stm32_u5_flash_bank1_end_addr = (FLASH_BASE + FLASH_BANK_SIZE);
 
   // check that address is in the range of flash
   uint32_t erase_begin_addr = MEMFAULT_COREDUMP_STORAGE_START_ADDR + offset;
